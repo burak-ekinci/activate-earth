@@ -193,7 +193,7 @@ contract ActivateEarthNFT is ERC721, Ownable, Pausable, ReentrancyGuard {
     ) external onlyOwner validNFTType(_nftTypeIndex) validNFTInputs(_input) nonReentrant {
         NFTType storage nftType = nftTypes[_nftTypeIndex];
         
-        // Max supply currentSupply'ın altına düşmemek kaydı ile düşedebilir
+        // maxSupply öncekinden küçük olabilir ama currentSupply’dan küçük olamaz
         if (_input.maxSupply < nftType.currentSupply) revert NewMaxSupplyTooLow();
         
         nftType.name = _input.name;
@@ -442,11 +442,12 @@ contract ActivateEarthNFT is ERC721, Ownable, Pausable, ReentrancyGuard {
      * @dev Get token URI for a specific token ID
      * @param tokenId Token ID
      */
-    function tokenURI(uint256 tokenId) public view override returns (string memory) {
-        if (bytes(tokenIdToBaseURI[tokenId]).length == 0) revert TokenURINotFound();
-        return tokenIdToBaseURI[tokenId];
-    }
-
+  function tokenURI(uint256 tokenId) public view override returns (string memory) {
+    _requireOwned(tokenId); 
+    string memory uri = tokenIdToBaseURI[tokenId];
+    if (bytes(uri).length == 0) revert TokenURINotFound();
+    return uri;
+}
     /**
      * @dev Check if user owns specific NFT type
      * @param user User address
