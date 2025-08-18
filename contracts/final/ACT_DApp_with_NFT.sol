@@ -6,42 +6,56 @@ import "@openzeppelin/contracts/utils/Pausable.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 
 /**
- * @title ActivateEarth NFT-Based Campaign DApp
- * @dev A contract for managing campaigns with NFT level restrictions
- * @notice This contract allows users to create campaigns based on their NFT level limits
- */
-
-/**
  * @title ActivateEarth NFT Interface
  * @dev Interface for interacting with ActivateEarthNFT contract
  */
 interface IActivateEarthNFT {
+    struct NFTType {
+        uint8 id;
+        string name;
+        uint256 price;
+        uint256 maxSupply;
+        uint256 currentSupply;
+        uint8 maxPoolNumber;
+        string baseURI;
+        bool isActive;
+        uint16 freeMintNumber;
+    }
+
     function getUserOwnedNFT(address user, uint8 _nftTypeIndex) external view returns (bool);
     function getNftTypeCounter() external view returns (uint8);
     function userLevel(address) external view returns (uint8);
-       function nftTypes(uint8 idx) external view
-      returns (
-        uint8 id,
-        string memory name,
-        uint256 price,
-        uint256 maxSupply,
-        uint256 currentSupply,
-        uint8 maxPoolNumber,
-        string memory baseURI,
-        bool isActive,
-        uint16 freeMintNumber
-      );
+
+    /// CLEAN API: Struct döndürür (auto-getter kullanmayın)
+    function getNftType(uint8 idx) external view returns (NFTType memory);
 }
+
+/**
+ * @title Chainlink PriceFeed Interface
+ * @dev Interface for interacting with Chainlink PriceFeed contract
+ */
+interface AggregatorV3Interface {
+    function decimals() external view returns (uint8);
+    function latestRoundData()
+        external
+        view
+        returns (uint80, int256 answer, uint256, uint256 updatedAt, uint80);
+}
+
 
 /**
  * @title ActivateEarthDapp
  * @dev Campaign management system with NFT level restrictions
  */
 contract ActivateEarthDapp is ReentrancyGuard, Pausable, Ownable {
- 
+
     // ============ STATE VARIABLES ============
-    uint256 private _campaignIds;
     IActivateEarthNFT private _nftContract;
+    AggregatorV3Interface private _priceFeed;
+    uint256 private _campaignIds;
+    uint256 public accruedFees;
+    uint256 public maxPriceStaleness = 24 hours;
+    uint16 public platformFeeBps = 500; 
 
     // ============ STRUCTS ============
     struct Campaign {
@@ -61,10 +75,12 @@ contract ActivateEarthDapp is ReentrancyGuard, Pausable, Ownable {
         mapping(address => bool) completedMembers;
     }
 
+    // (DİKKAT) DApp içinde NFTType struct YOK — yalnızca interface tarafındaki kullanılacak
+
     // ============ MAPPINGS ============
     mapping(uint256 => Campaign) public campaigns;
     mapping(address => uint256) public balances;
-    mapping(address => uint256) public userCampaignCount; // 🆕 User'ın oluşturduğu campaign sayısı
+    mapping(address => uint256) public userCampaignCount;
 
     // ============ EVENTS ============
     event CampaignCreated(
@@ -92,11 +108,11 @@ contract ActivateEarthDapp is ReentrancyGuard, Pausable, Ownable {
     event TokensWithdrawn(address indexed member, uint256 amount);
     event CampaignCancelled(uint256 indexed campaignId);
     event CampaignStatusUpdated(uint256 indexed campaignId, bool status);
+    event PlatformFeeUpdated(uint16 newBps);
+
 
     // ============ CONSTANTS ============
     uint256 private constant DAILY = 1 days;
-    uint256 private constant WEEKLY = 7 days;
-    uint256 private constant MONTHLY = 30 days;
 
     // ============ CUSTOM ERRORS ============
     error InvalidNFTContract();
@@ -115,14 +131,14 @@ contract ActivateEarthDapp is ReentrancyGuard, Pausable, Ownable {
     error TransferFailed();
     error InsufficientBalance();
     error NFTContractCallFailed();
-
-    // ============ ENUMS ============
-    enum DurationType {
-        DAILY,
-        WEEKLY,
-        MONTHLY,
-        UNLIMITED
-    }
+    error RegistrationFull();
+    error NotCreator();
+    error TooEarly();
+    //chainlink
+    error PriceFeedNotSet();
+    error InvalidOracleAnswer();
+    error StalePrice();
+    error BelowMinPerMember(uint256 minWei, uint256 givenWei);
 
     // ============ MODIFIERS ============
     modifier validCampaign(uint256 campaignId) {
@@ -132,10 +148,6 @@ contract ActivateEarthDapp is ReentrancyGuard, Pausable, Ownable {
     }
 
     // ============ CONSTRUCTOR ============
-    /**
-     * @dev Initialize the dApp with NFT contract address
-     * @param nftContractAddress Address of the ActivateEarthNFT contract
-     */
     constructor(address nftContractAddress) Ownable(msg.sender) {
         if (nftContractAddress == address(0)) revert InvalidNFTContract();
         _nftContract = IActivateEarthNFT(nftContractAddress);
@@ -145,88 +157,83 @@ contract ActivateEarthDapp is ReentrancyGuard, Pausable, Ownable {
 
     /**
      * @dev Creates a new campaign with NFT level restrictions
-     * @param title Campaign title
-     * @param description Campaign description
-     * @param totalMemberNumber Total number of members allowed
-     * @param duration Duration multiplier
-     * @param durationType Duration type ("DAILY", "WEEKLY", "MONTHLY", "UNLIMITED")
      */
- function createCampaign(
+function createCampaign(
     string memory title,
     string memory description,
     uint256 totalMemberNumber,
-    uint256 duration,
-    DurationType durationType
+    uint256 duration
 ) external payable whenNotPaused nonReentrant {
-
     if (bytes(title).length == 0)             revert InvalidCampaignData();
     if (bytes(description).length == 0)       revert InvalidCampaignData();
     if (totalMemberNumber == 0)               revert InvalidCampaignData();
     if (duration == 0)                        revert InvalidCampaignData();
     if (msg.value == 0)                       revert InvalidCampaignData();
-    if (msg.value % totalMemberNumber != 0)   revert InvalidCampaignData();
-   
-  
 
+    // ---- NFT level ----
     uint8 level;
-    try _nftContract.userLevel(msg.sender) returns (uint8 _level) {
-        level = _level;
-    } catch {
-        revert NFTContractCallFailed();
+    {
+        try _nftContract.userLevel(msg.sender) returns (uint8 _level) {
+            level = _level;
+        } catch {
+            revert NFTContractCallFailed();
+        }
     }
-    
     if (level == 0) revert UserHasNoNFT();
 
-    uint8 maxPoolNumber;
-    bool isActive;
-    
-    try _nftContract.nftTypes(level) returns (
-        uint8,      // id
-        string memory,   // name
-        uint256,    // price
-        uint256,    // maxSupply
-        uint256,    // currentSupply
-        uint8 _maxPoolNumber,
-        string memory,    // baseURI
-        bool _isActive,
-        uint16      // freeMintNumber
-    ) {
-        maxPoolNumber = _maxPoolNumber;
-        isActive = _isActive;
-    } catch {
-        revert NFTContractCallFailed();
+    {
+        try _nftContract.getNftType(level) returns (IActivateEarthNFT.NFTType memory t) {
+            if (!t.isActive) revert NFTTypeNotActive();
+            if (userCampaignCount[msg.sender] >= t.maxPoolNumber) revert CampaignLimitReached();
+        } catch {
+            revert NFTContractCallFailed();
+        }
     }
 
-    if (!isActive)          revert NFTTypeNotActive();
-    if (userCampaignCount[msg.sender] >= maxPoolNumber) revert CampaignLimitReached();
-
-    uint256 endDate = _calculateEndDate(duration, durationType);
+    uint256 endDate = _calculateEndDate(duration);
 
     _campaignIds++;
     uint256 campaignId = _campaignIds;
-    Campaign storage newCampaign = campaigns[campaignId];
+    Campaign storage c = campaigns[campaignId];
 
-    newCampaign.id                    = campaignId;
-    newCampaign.creator               = msg.sender;
-    newCampaign.title                 = title;
-    newCampaign.description           = description;
-    newCampaign.isActive              = true;
-    newCampaign.endDate               = endDate;
-    newCampaign.tokenAmount           = msg.value;
-    newCampaign.tokenAmountPerMember  = msg.value / totalMemberNumber;
-    newCampaign.totalMemberNumber     = totalMemberNumber;
+    // Önce storage’a yazalım (stack basıncını azaltır)
+    c.id               = campaignId;
+    c.creator          = msg.sender;
+    c.title            = title;
+    c.description      = description;
+    c.isActive         = true;
+    c.endDate          = endDate;
+    c.totalMemberNumber= totalMemberNumber;
 
-    // Kullanıcının açabileceği kampanya sayısını arttıralım
+    // ---- Fee ve net hesap (kısa kapsam) ----
+    {
+        uint256 fee = (msg.value * platformFeeBps) / 10_000; // BPS_DENOMINATOR kullanıyorsan ona göre değiştir
+        uint256 net = msg.value - fee;
+
+        if (net % totalMemberNumber != 0) revert InvalidCampaignData();
+
+        // (opsiyonel) min $0.01 kontrolü net üzerinden yapıyorsan burada:
+        // uint256 perMember = net / totalMemberNumber;
+        // uint256 minWei = _minPerMemberWei();
+        // if (perMember < minWei) revert BelowMinPerMember(minWei, perMember);
+
+        accruedFees += fee;
+
+        c.tokenAmount          = net;
+        c.tokenAmountPerMember = net / totalMemberNumber;
+    }
+
     userCampaignCount[msg.sender]++;
 
+    // Event'te local değişkenler yerine storage alanlarını kullan
     emit CampaignCreated(
         campaignId,
         msg.sender,
-        title,
+        c.title,
         block.timestamp,
-        endDate,
-        totalMemberNumber,
-        msg.value,
+        c.endDate,
+        c.totalMemberNumber,
+        c.tokenAmount,
         level
     );
 }
@@ -234,14 +241,22 @@ contract ActivateEarthDapp is ReentrancyGuard, Pausable, Ownable {
 
     /**
      * @dev Register for a campaign
-     * @param campaignId ID of the campaign
      */
-    function registerCampaign(uint256 campaignId) external whenNotPaused nonReentrant validCampaign(campaignId) {
+    function registerCampaign(uint256 campaignId)
+        external
+        whenNotPaused
+        nonReentrant
+        validCampaign(campaignId)
+    {
         Campaign storage campaign = campaigns[campaignId];
 
         if (block.timestamp > campaign.endDate) revert CampaignEnded();
-        if (campaign.registeredMembers[msg.sender]) revert AlreadyRegistered();
         if (!campaign.isActive) revert CampaignNotActive();
+
+        // KAPASİTE KONTROLÜ — over-registration engeli
+        if (campaign.registeredMemberNumber >= campaign.totalMemberNumber) revert RegistrationFull();
+
+        if (campaign.registeredMembers[msg.sender]) revert AlreadyRegistered();
         if (campaign.completedMemberNumber >= campaign.totalMemberNumber) revert CampaignWasCompleted();
 
         campaign.registeredMembers[msg.sender] = true;
@@ -257,15 +272,19 @@ contract ActivateEarthDapp is ReentrancyGuard, Pausable, Ownable {
 
     /**
      * @dev Complete a campaign task
-     * @param campaignId ID of the campaign
      */
-    function completeCampaign(uint256 campaignId) external whenNotPaused nonReentrant validCampaign(campaignId) {
+    function completeCampaign(uint256 campaignId)
+        external
+        whenNotPaused
+        nonReentrant
+        validCampaign(campaignId)
+    {
         Campaign storage campaign = campaigns[campaignId];
 
         if (block.timestamp > campaign.endDate) revert CampaignEnded();
+        if (!campaign.isActive) revert CampaignNotActive();
         if (!campaign.registeredMembers[msg.sender]) revert NotRegistered();
         if (campaign.completedMembers[msg.sender]) revert AlreadyCompleted();
-        if (!campaign.isActive) revert CampaignNotActive();
         if (campaign.completedMemberNumber >= campaign.totalMemberNumber) revert CampaignWasCompleted();
 
         campaign.completedMembers[msg.sender] = true;
@@ -273,7 +292,6 @@ contract ActivateEarthDapp is ReentrancyGuard, Pausable, Ownable {
         campaign.completedMemberNumber++;
         balances[msg.sender] += campaign.tokenAmountPerMember;
 
-        // If campaign is fully completed, decrease creator's campaign count
         if (campaign.completedMemberNumber >= campaign.totalMemberNumber) {
             userCampaignCount[campaign.creator]--;
         }
@@ -294,38 +312,64 @@ contract ActivateEarthDapp is ReentrancyGuard, Pausable, Ownable {
         if (amount == 0) revert NoTokensToWithdraw();
 
         balances[msg.sender] = 0;
-        
+
         (bool success, ) = payable(msg.sender).call{value: amount}("");
         if (!success) revert TransferFailed();
 
         emit TokensWithdrawn(msg.sender, amount);
     }
 
-    // ============ ADMIN FUNCTIONS ============
+    // ============ POST-END FINALIZATION ============
 
     /**
-     * @dev Update campaign status (only owner)
-     * @param campaignId ID of the campaign
-     * @param status New status
+     * @dev Creator can finalize after end date to reclaim remaining funds
      */
-    function updateCampaignStatus(uint256 campaignId, bool status) external onlyOwner validCampaign(campaignId) {
+    function finalizeAfterEnd(uint256 campaignId)
+        external
+        nonReentrant
+        validCampaign(campaignId)
+    {
+        Campaign storage campaign = campaigns[campaignId];
+        if (msg.sender != campaign.creator) revert NotCreator();
+        if (block.timestamp <= campaign.endDate) revert TooEarly();
+        if (!campaign.isActive) revert CampaignNotActive();
+
+        uint256 remaining = campaign.tokenAmount - campaign.completedTokenAmount;
+        campaign.isActive = false;
+        userCampaignCount[campaign.creator]--;
+
+        if (remaining > 0) {
+            (bool ok, ) = payable(campaign.creator).call{value: remaining}("");
+            if (!ok) revert TransferFailed();
+        }
+
+        emit CampaignCancelled(campaignId); // istersen ayrı "Finalized" eventi ekleyebilirsin
+    }
+
+    // ============ ADMIN FUNCTIONS ============
+// campaign ownerı kendi statusunu değişebilmeli
+    function updateCampaignStatus(uint256 campaignId, bool status)
+        external
+        onlyOwner
+        nonReentrant
+        validCampaign(campaignId)
+    {
         Campaign storage campaign = campaigns[campaignId];
         campaign.isActive = status;
         emit CampaignStatusUpdated(campaignId, status);
     }
 
-    /**
-     * @dev Cancel campaign and refund creator (only owner)
-     * @param campaignId ID of the campaign
-     */
-    function cancelCampaign(uint256 campaignId) external onlyOwner validCampaign(campaignId) {
+    function cancelCampaign(uint256 campaignId)
+        external
+        onlyOwner
+        nonReentrant
+        validCampaign(campaignId)
+    {
         Campaign storage campaign = campaigns[campaignId];
         if (!campaign.isActive) revert CampaignNotActive();
 
         uint256 remainingTokens = campaign.tokenAmount - campaign.completedTokenAmount;
         campaign.isActive = false;
-        
-        // Decrease user's campaign count
         userCampaignCount[campaign.creator]--;
 
         if (remainingTokens > 0) {
@@ -337,89 +381,67 @@ contract ActivateEarthDapp is ReentrancyGuard, Pausable, Ownable {
     }
 
     /**
-     * @dev Emergency withdraw (only owner) - Can only withdraw unclaimed campaign funds
-     * @param amount Amount to withdraw
+     * @dev Emergency withdraw (owner)
+     * UYARI: Ürün politikanıza göre kısıtlayın ya da kaldırın.
      */
-    function emergencyWithdraw(uint256 amount) external onlyOwner {
+    function emergencyWithdraw(uint256 amount) external onlyOwner nonReentrant {
         uint256 contractBalance = address(this).balance;
         if (amount > contractBalance) revert InsufficientBalance();
-        
+
         (bool success, ) = payable(owner()).call{value: amount}("");
         if (!success) revert TransferFailed();
     }
 
-    /**
-     * @dev Pause contract
-     */
-    function pause() external onlyOwner {
-        _pause();
-    }
-
-    /**
-     * @dev Unpause contract
-     */
-    function unpause() external onlyOwner {
-        _unpause();
-    }
+    function pause() external onlyOwner nonReentrant { _pause(); }
+    function unpause() external onlyOwner nonReentrant { _unpause(); }
 
     // ============ INTERNAL FUNCTIONS ============
 
-    /**
-     * @dev Calculate campaign end date based on duration type
-     */
-     function _calculateEndDate(
-        uint256 duration,
-        DurationType durationType
-    ) internal view returns (uint256) {
-        if (durationType == DurationType.UNLIMITED) {
-            return type(uint256).max;
-        }
-        
-        // Prevent overflow by limiting duration
-        if (duration > 10000) revert InvalidCampaignData(); // Max ~27 years for daily
-        
-        uint256 timeMultiplier;
-        if (durationType == DurationType.DAILY) {
-            timeMultiplier = DAILY;
-        } else if (durationType == DurationType.WEEKLY) {
-            timeMultiplier = WEEKLY;
-        } else if (durationType == DurationType.MONTHLY) {
-            timeMultiplier = MONTHLY;
-        }
-        
-        // Check for overflow before multiplication
-        if (duration > type(uint256).max / timeMultiplier) {
-            revert InvalidCampaignData();
-        }
-        
-        uint256 durationInSeconds = timeMultiplier * duration;
-        
-        // Check for overflow before addition
-        if (block.timestamp > type(uint256).max - durationInSeconds) {
-            revert InvalidCampaignData();
-        }
-        
-        return block.timestamp + durationInSeconds;
+    function _calculateEndDate(uint256 days_) internal view returns (uint256) {
+        if (days_ == 0 || days_ > 10_000) revert InvalidCampaignData();
+        return block.timestamp + days_ * 1 days; // yeterli
+    }
+
+    function _minPerMemberWei() internal view returns (uint256) {
+    if (address(_priceFeed) == address(0)) revert PriceFeedNotSet();
+
+    (, int256 answer,, uint256 updatedAt,) = _priceFeed.latestRoundData();
+    if (answer <= 0) revert InvalidOracleAnswer();
+    if (updatedAt + maxPriceStaleness < block.timestamp) revert StalePrice();
+
+    uint8 p = _tryDecimals(_priceFeed);            // örn. 8
+    uint256 priceScaled = uint256(answer);         // USD fiyatı * 10^p
+    uint256 scale = 10 ** uint256(p);
+
+    // minWei for $0.01 = (1 ETH * 10^p) / (priceScaled * 100)
+    // → integer güvenli (1e18 * 1e8 / (price*100))
+    return (1e18 * scale) / (priceScaled * 100);
+    }
+
+    function _tryDecimals(AggregatorV3Interface feed) private view returns (uint8) {
+        // çoğu feed decimals() destekler; çağrı ucuzdur ve revert etmez
+        try feed.decimals() returns (uint8 d) { return d; } catch { return 8; }
     }
 
     // ============ VIEW FUNCTIONS ============
 
-    /**
-     * @dev Get campaign details
-     * @param campaignId Campaign ID
-     */
-    function getCampaignDetails(uint256 campaignId) external view validCampaign(campaignId) returns (
-        address creator,
-        string memory title,
-        string memory description,
-        bool isActive,
-        uint256 endDate,
-        uint256 totalMemberNumber,
-        uint256 completedMemberNumber,
-        uint256 registeredMemberNumber,
-        uint256 tokenAmount,
-        uint256 tokenAmountPerMember
-    ) {
+    function getCampaignDetails(uint256 campaignId)
+        external
+        view
+        validCampaign(campaignId)
+        returns (
+            address creator,
+            string memory title,
+            string memory description,
+            bool isActive,
+            uint256 endDate,
+            uint256 totalMemberNumber,
+            uint256 completedMemberNumber,
+            uint256 registeredMemberNumber,
+            uint256 tokenAmount,
+            uint256 tokenAmountPerMember
+        )
+    {
         Campaign storage campaign = campaigns[campaignId];
         return (
             campaign.creator,
@@ -435,25 +457,30 @@ contract ActivateEarthDapp is ReentrancyGuard, Pausable, Ownable {
         );
     }
 
-    /**
-     * @dev Check if user is registered for campaign
-     */
-    function isRegistered(uint256 campaignId, address user) external view validCampaign(campaignId) returns (bool) {
+    function isRegistered(uint256 campaignId, address user)
+        external
+        view
+        validCampaign(campaignId)
+        returns (bool)
+    {
         return campaigns[campaignId].registeredMembers[user];
     }
 
-    /**
-     * @dev Check if user completed campaign
-     */
-    function isCompleted(uint256 campaignId, address user) external view validCampaign(campaignId) returns (bool) {
+    function isCompleted(uint256 campaignId, address user)
+        external
+        view
+        validCampaign(campaignId)
+        returns (bool)
+    {
         return campaigns[campaignId].completedMembers[user];
     }
 
-    function getuserlevel() external view returns(uint256){
+    function getuserlevel() external view returns (uint256) {
         return _nftContract.userLevel(msg.sender);
     }
 
-   function getnft(uint8 typeIndex)
+    /// Eski arayüzü koruyarak struct'tan parçalayarak döndürürüz
+    function getnft(uint8 typeIndex)
         external
         view
         returns (
@@ -464,78 +491,67 @@ contract ActivateEarthDapp is ReentrancyGuard, Pausable, Ownable {
             uint256 currentSupply,
             uint8   maxPoolNumber,
             string memory baseURI,
-            bool    isActive,
+            bool    isActive, 
             uint16  freeMintNumber
         )
     {
-        return _nftContract.nftTypes(typeIndex);
+        IActivateEarthNFT.NFTType memory t = _nftContract.getNftType(typeIndex);
+        return (t.id, t.name, t.price, t.maxSupply, t.currentSupply, t.maxPoolNumber, t.baseURI, t.isActive, t.freeMintNumber);
     }
 
-    /**
-     * @dev Get user balance
-     */
     function getBalance(address user) external view returns (uint256) {
         return balances[user];
     }
 
-    /**
-     * @dev Get user's current campaign count
-     */
     function getUserCampaignCount(address user) external view returns (uint256) {
         return userCampaignCount[user];
     }
 
-    /**
-     * @dev Get user's campaign limit based on NFT level
-     */
-    // function getUserCampaignLimit(address user) external view returns (uint256) {
-    //     uint8 userLevel = _nftContract.userLevel(user);
-    //     if (userLevel == 0) return 0;
-        
-    //     NFTType memory nftType = _nftContract.nftTypes(userLevel);
-    //     return nftType.maxPoolNumber;
-    // }
+    function getUserCampaignLimit(address user) external view returns (uint256) {
+        uint8 userLevel = _nftContract.userLevel(user);
+        if (userLevel == 0) return 0;
 
-    /**
-     * @dev Get user's remaining campaign slots
-     */
-    // function getUserRemainingSlots(address user) external view returns (uint256) {
-    //     uint8 userLevel = _nftContract.userLevel(user);
-    //     if (userLevel == 0) return 0;
-        
-    //     NFTType memory nftType = _nftContract.nftTypes(userLevel);
-    //     uint256 currentCount = userCampaignCount[user];
-        
-    //     if (currentCount >= nftType.maxPoolNumber) {
-    //         return 0;
-    //     }
-        
-    //     return nftType.maxPoolNumber - currentCount;
-    // }
+        IActivateEarthNFT.NFTType memory nftType = _nftContract.getNftType(userLevel);
+        return nftType.maxPoolNumber;
+    }
 
-    /**
-     * @dev Get NFT contract address
-     */
+    function getUserRemainingSlots(address user) external view returns (uint256) {
+        uint8 userLevel = _nftContract.userLevel(user);
+        if (userLevel == 0) return 0;
+
+        IActivateEarthNFT.NFTType memory nftType = _nftContract.getNftType(userLevel);
+        uint256 currentCount = userCampaignCount[user];
+        if (currentCount >= nftType.maxPoolNumber) return 0;
+
+        return nftType.maxPoolNumber - currentCount;
+    }
+
     function getNFTContract() external view returns (address) {
         return address(_nftContract);
     }
 
-    /**
-     * @dev Get total campaigns created
-     */
     function getTotalCampaigns() external view returns (uint256) {
         return _campaignIds;
     }
 
-    // ============ FALLBACK FUNCTIONS ============
+    // ============ SETTER FUNCTIONS ============
     
-    /**
-     * @dev Receive ETH
-     */
-    receive() external payable {}
+    function setPlatformFeeBps(uint16 newBps) external onlyOwner nonReentrant {
+    platformFeeBps = newBps;
+    emit PlatformFeeUpdated(newBps);
+    }
 
-    /**
-     * @dev Fallback function
-     */
+    function setPriceFeed(address feed) external onlyOwner {
+    require(feed != address(0), "zero feed");
+    _priceFeed = AggregatorV3Interface(feed);
+    }
+
+    function setMaxPriceStaleness(uint256 seconds_) external onlyOwner {
+        require(seconds_ >= 60 && seconds_ <= 7 days, "bad staleness");
+        maxPriceStaleness = seconds_;
+    }
+
+    // ============ FALLBACK ============
+    receive() external payable {}
     fallback() external payable {}
 }
